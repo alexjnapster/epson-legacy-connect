@@ -600,7 +600,7 @@ enum Destination: String, CaseIterable, Identifiable {
         guard !checkingHealth else { return }
         checkingHealth = true
         defer { checkingHealth = false }
-        let host = discovery.printers.first?.host ?? snapshot?.queues.first(where: { $0.id == selectedQueue && $0.isNetwork }).flatMap { URL(string: $0.uri)?.host }
+        let host = snapshot?.queues.first(where: { $0.id == selectedQueue && $0.isNetwork }).flatMap { URL(string: $0.uri)?.host } ?? discovery.printers.first?.host
         guard let host else {
             printerReachable = nil
             lastHealthCheck = Date()
@@ -746,7 +746,7 @@ struct OverviewView: View {
     var body: some View {
         HealthView(discovery: model.discovery)
         NetworkPrintersView(discovery: model.discovery)
-        if !wifiDetected { Card {
+        if !wifiDetected && model.snapshot?.queues.contains(where: { $0.isNetwork }) != true { Card {
             HStack(spacing: 30) {
                 Image(systemName: "printer.fill").font(.system(size: 80)).foregroundStyle(.teal.gradient)
                     .frame(width: 150, height: 145).accessibilityHidden(true)
