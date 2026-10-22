@@ -28,6 +28,18 @@ public struct WirelessState: Sendable {
     public let setupProcess: Int
 }
 
+public enum WirelessScanStatus: Int, Sendable {
+    case running = 1, complete = 2
+    public static func parse(_ reply: Data) throws -> WirelessScanStatus {
+        let groups = try ConfigurationResponse.parse(reply)
+        guard let value = groups["ijcp:SSIDScan"]?["ijcp:SSIDScan"], let code = Int(value),
+              let status = Self(rawValue: code) else {
+            throw ComponentFiles.failure("The printer could not complete its Wi-Fi scan. Try searching again.")
+        }
+        return status
+    }
+}
+
 public enum ConfigurationError: LocalizedError {
     case componentMissing, invalidReply, printerRejected, unsupportedModel, noPrinter
     public var errorDescription: String? {
@@ -130,6 +142,10 @@ public struct USBConfiguration {
         let reply = try exchange(printer, request: request)
         let groups = try ConfigurationResponse.parse(reply, expectedResponse: "SetDataResponse")
         guard groups["ijcp:SSIDScan"] != nil else { throw ConfigurationError.invalidReply }
+    }
+
+    public func wirelessScanStatus(_ printer: USBPrinter) throws -> WirelessScanStatus {
+        try WirelessScanStatus.parse(readData(printer, groups: ["SSIDScan"]))
     }
 
     public static func wifiRequest(ssid: String, password: String) throws -> Data {

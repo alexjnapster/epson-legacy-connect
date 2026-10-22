@@ -41,6 +41,9 @@ public enum PowerOffTimer: Int, CaseIterable, Identifiable, Codable, Sendable {
     case alwaysOn = 0, twoHours = 2, fourHours = 4, eightHours = 8, twelveHours = 12
     public var id: Int { rawValue }
     public var label: String { self == .alwaysOn ? L("Always on") : L("After %d hours", rawValue) }
+    /// UT1126's mapping, reconstructed from Epson's installed model resources.
+    /// Kept separate from the UI enum. No power command is sent by this property.
+    public var firmwareParameter: UInt8 { self == .alwaysOn ? 255 : UInt8(rawValue) }
 }
 
 public enum WiFiValidationError: LocalizedError, Equatable {

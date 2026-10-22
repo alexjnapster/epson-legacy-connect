@@ -16,7 +16,7 @@ public enum NetworkVerification {
 
     /// Open and close a TCP connection, without sending a print job.
     public static func printPortReachable(_ address: String) -> Bool {
-        guard usableIPv4(address) else { return false }
+        guard usableIPv4(address) || address.range(of: #"^[A-Za-z0-9][A-Za-z0-9-]{0,62}\.local\.?$"#, options: .regularExpression) != nil else { return false }
         let connection = NWConnection(host: NWEndpoint.Host(address), port: 9100, using: .tcp)
         let queue = DispatchQueue(label: "local.photo1500.verify")
         let semaphore = DispatchSemaphore(value: 0)

@@ -14,8 +14,11 @@ public struct NetworkPrinter: Identifiable, Sendable {
     @Published public private(set) var error: String?
     private let browser = NetServiceBrowser()
     private var services: [NetService] = []
+    private var started = false
     public override init() { super.init(); browser.delegate = self }
-    public func start() {
+    public func start(restart: Bool = false) {
+        guard !started || restart else { return }
+        started = true
         browser.stop()
         services.forEach { $0.stop() }
         services = []; printers = []; error = nil
@@ -42,6 +45,7 @@ public struct NetworkPrinter: Identifiable, Sendable {
         printers.sort { $0.name < $1.name }
     }
     public func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
+        started = false
         error = L("Network discovery is unavailable. Check Local Network permission in System Settings.")
     }
 }
