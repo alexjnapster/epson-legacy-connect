@@ -70,6 +70,12 @@ public enum PrinterCare {
               attribute("printer-is-accepting-jobs", in: attributes) == "true" else {
             throw ComponentFiles.failure("The print queue is busy or paused. Finish existing jobs before starting maintenance.")
         }
+        if let uri = attribute("device-uri", in: attributes), let device = URL(string: uri), device.scheme == "socket" {
+            guard device.port == nil || device.port == 9100,
+                  let host = device.host, NetworkVerification.printPortReachable(host) else {
+                throw ComponentFiles.failure("The printer is offline. Maintenance was not queued; turn the printer on and check its Wi-Fi connection before trying again.")
+            }
+        }
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".command")
         guard FileManager.default.createFile(atPath: file.path, contents: action.commandFile, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
         defer { try? FileManager.default.removeItem(at: file) }
