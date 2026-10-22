@@ -134,6 +134,40 @@ final class PrinterCoreTests {
         XCTAssertEqual(PowerOffTimer.alwaysOn.rawValue, 0)
     }
 
+    func testBridgeElectionIsStableAndExcludesUnreadyHosts() {
+        let now = Date(timeIntervalSince1970: 100)
+        let first = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let second = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        func candidate(_ id: UUID, age: Double = 0, ready: Bool = true, reachable: Bool = true, hosting: Bool = false, printer: String = "test-printer") -> BridgeCandidate {
+            BridgeCandidate(id: id, printerID: printer, lastSeen: now.addingTimeInterval(-age), driverReady: ready, printerReachable: reachable, hosting: hosting)
+        }
+        func leader(_ candidates: [BridgeCandidate]) -> UUID? { BridgeElection.leader(for: "test-printer", candidates: candidates, now: now) }
+        XCTAssertEqual(leader([candidate(second), candidate(first)]), first)
+        XCTAssertEqual(leader([candidate(first), candidate(second, hosting: true)]), second)
+        XCTAssertEqual(leader([candidate(second, hosting: true), candidate(first, hosting: true)]), first)
+        XCTAssertEqual(leader([candidate(first, age: 15, hosting: true), candidate(second)]), second)
+        XCTAssertEqual(leader([candidate(first, ready: false), candidate(second)]), second)
+        XCTAssertEqual(leader([candidate(first, reachable: false), candidate(second)]), second)
+        XCTAssertNil(leader([candidate(first, printer: "other-printer")]))
+        XCTAssertNil(leader([candidate(first, age: -1)]))
+        XCTAssertNil(leader([candidate(first), candidate(first)]))
+        XCTAssertNil(leader([]))
+    }
+
+    func testAirPrintArgumentsRejectInjectedOptionsAndUnsupportedFormats() throws {
+        let environment = ["CONTENT_TYPE": "image/urf", "IPP_COPIES": "2", "IPP_MEDIA": "iso_a4_210x297mm", "IPP_PRINT_COLOR_MODE": "monochrome"]
+        let arguments = try AirPrintJob.arguments(queue: "Photo_Queue", file: "/tmp/test.urf", environment: environment)
+        XCTAssertEqual(arguments.prefix(4).map { $0 }, ["-d", "Photo_Queue", "-t", "AirPrint document"])
+        XCTAssertTrue(arguments.contains("EPIJ_Ink_=0"))
+        XCTAssertEqual(arguments.last, "/tmp/test.urf")
+        XCTAssertThrowsError(try AirPrintJob.arguments(queue: "-bad", file: "/tmp/test.urf", environment: environment))
+        XCTAssertThrowsError(try AirPrintJob.arguments(queue: "Photo", file: "/tmp/test.ps", environment: ["CONTENT_TYPE": "application/postscript"]))
+        XCTAssertThrowsError(try AirPrintJob.arguments(queue: "Photo", file: "/tmp/test.urf", environment: ["CONTENT_TYPE": "image/urf", "IPP_COPIES": "2 -d Other"]))
+        XCTAssertThrowsError(try AirPrintJob.arguments(queue: "Photo", file: "/tmp/test.urf", environment: ["CONTENT_TYPE": "image/urf", "IPP_MEDIA": "A4 copies=100"]))
+        XCTAssertTrue(AirPrintJob.validMediaCollection("{media-size={x-dimension=21000 y-dimension=29700} media-type=stationery}"))
+        for value in ["{} copies=99 {}", "{media=A4", "{media=$(command)}", "{media=A4}\n"] { XCTAssertTrue(!AirPrintJob.validMediaCollection(value)) }
+    }
+
 }
 
 // Standalone checks also run with Apple's Command Line Tools, where XCTest
@@ -179,6 +213,8 @@ func XCTAssertNoThrow<T>(_ expression: @autoclosure () throws -> T, file: Static
         try tests.testScanStatusNeverAcceptsUnknownOrRejectedResults()
         tests.testJobParsingIsBoundToQueueAndRejectsMalformedIDs()
         tests.testPowerParametersAreSeparateFromUITimerValues()
-        print("PASS: 18 core checks")
+        tests.testBridgeElectionIsStableAndExcludesUnreadyHosts()
+        try tests.testAirPrintArgumentsRejectInjectedOptionsAndUnsupportedFormats()
+        print("PASS: 20 core checks")
     }
 }
