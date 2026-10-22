@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+.DS_Store
+._*
+Sources/EpsonWiFiAssistant/Resources/Vendor/
+Research/
+*.dmg
+*.pkg
+*.plugin/
+*.app/
+*.log
+*.zip
+*.xcresult/
