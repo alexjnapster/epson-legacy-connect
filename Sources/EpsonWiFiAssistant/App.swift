@@ -1,5 +1,8 @@
 import SwiftUI
 import PrinterCore
+import PDFKit
+import UniformTypeIdentifiers
+import ApplicationServices
 
 @main
 struct EpsonWiFiAssistantApp: App {
@@ -50,6 +53,13 @@ struct EpsonWiFiAssistantApp: App {
                 exit(1)
             }
         }
+        if let index = CommandLine.arguments.firstIndex(of: "--inspect-care"), CommandLine.arguments.count > index + 1 {
+            do {
+                let actions = try PrinterCare.capabilities(queue: CommandLine.arguments[index + 1])
+                print("Driver advertises: " + actions.map(\.rawValue).joined(separator: ", "))
+                exit(0)
+            } catch { FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8)); exit(1) }
+        }
         if CommandLine.arguments.contains("--diagnose") {
             let snapshot = PrinterDiagnostics.capture()
             let encoder = JSONEncoder()
@@ -61,11 +71,16 @@ struct EpsonWiFiAssistantApp: App {
         NSApplication.shared.setActivationPolicy(.regular)
     }
     var body: some Scene {
-        WindowGroup("Epson Legacy Connect") {
+        WindowGroup("Epson Legacy Connect", id: "main") {
             ContentView().environmentObject(model)
                 .environment(\.locale, model.language.locale)
                 .frame(minWidth: 900, minHeight: 660)
-                .task { await model.refresh() }
+                .task {
+                    while !Task.isCancelled {
+                        await model.refresh()
+                        do { try await Task.sleep(nanoseconds: 20_000_000_000) } catch { break }
+                    }
+                }
                 .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         }
         .windowStyle(.titleBar)
@@ -73,15 +88,140 @@ struct EpsonWiFiAssistantApp: App {
     }
 }
 
+@MainActor final class PrinterStatusMenu: NSObject {
+    weak var model: AssistantModel?
+    private let item: NSStatusItem
+    private let popover = NSPopover()
+    init(model: AssistantModel) {
+        self.model = model
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        super.init()
+        item.button?.image = NSImage(systemSymbolName: "printer", accessibilityDescription: "Epson Legacy Connect")
+        item.button?.image?.isTemplate = true
+        item.button?.toolTip = "Epson Legacy Connect"
+        item.button?.target = self
+        item.button?.action = #selector(toggle)
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 380, height: 560)
+        popover.contentViewController = NSHostingController(rootView: PrinterQuickPanel(model: model, discovery: model.discovery, open: { [weak self] destination in
+            self?.popover.performClose(nil)
+            self?.model?.destination = destination
+            self?.model?.showDashboard?()
+        }))
+    }
+    func remove() { popover.performClose(nil); NSStatusBar.system.removeStatusItem(item) }
+    func show() { toggle() }
+    @objc private func toggle() {
+        if popover.isShown { popover.performClose(nil); return }
+        guard let button = item.button else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.title = L("Printer menu")
+        popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+struct PrinterQuickPanel: View {
+    @ObservedObject var model: AssistantModel
+    @ObservedObject var discovery: PrinterDiscovery
+    let open: (Destination) -> Void
+    private func inkColor(_ name: String) -> Color {
+        if name.contains("Cyan") { return .cyan }
+        if name.contains("Magenta") { return .pink }
+        if name.contains("Yellow") { return .yellow }
+        return .primary
+    }
+    private func shortcut(_ title: String, _ symbol: String, _ destination: Destination) -> some View {
+        Button { open(destination) } label: {
+            VStack(alignment: .leading, spacing: 9) {
+                Image(systemName: symbol).font(.system(size: 19, weight: .medium)).foregroundStyle(.teal)
+                Text(L(title)).font(.system(size: 12, weight: .semibold)).lineLimit(2)
+            }.frame(maxWidth: .infinity, minHeight: 57, alignment: .leading).padding(13)
+                .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
+                .contentShape(RoundedRectangle(cornerRadius: 13))
+        }.buttonStyle(.plain).accessibilityLabel(L(title))
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 11) {
+                if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"), let icon = NSImage(contentsOfFile: path) {
+                    Image(nsImage: icon).resizable().frame(width: 46, height: 46).accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(discovery.printers.first?.name ?? "Epson Legacy Connect").font(.system(size: 14, weight: .bold)).lineLimit(1)
+                    Text(L("Your printer, at a glance")).font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button { open(.overview) } label: { Image(systemName: "arrow.up.forward.app").font(.system(size: 16)) }
+                    .buttonStyle(.plain).help(L("Open printer dashboard")).accessibilityLabel(L("Open printer dashboard"))
+            }
+            HStack(spacing: 9) {
+                Circle().fill(model.printerReachable == true ? Color.teal : Color.orange).frame(width: 7, height: 7)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L(model.printerReachable == true ? "Printer reachable" : "Connection needs checking")).font(.system(size: 12, weight: .semibold))
+                    if let date = model.lastHealthCheck {
+                        Text(L("Last checked %@.", date.formatted(.dateTime.locale(model.language.locale).hour().minute())))
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if model.refreshing || model.checkingHealth { ProgressView().controlSize(.small) }
+                else { Image(systemName: "wifi").foregroundStyle(.secondary) }
+            }.padding(12).background(.teal.opacity(0.07), in: RoundedRectangle(cornerRadius: 13))
+            if model.menuShowsInk, let inks = model.snapshot?.inks, !inks.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(L("Ink reported by the driver")).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                    HStack(spacing: 9) {
+                        ForEach(inks) { ink in
+                            VStack(spacing: 5) {
+                                Capsule().fill(inkColor(ink.name).opacity(0.15)).frame(height: 6)
+                                    .overlay(alignment: .leading) {
+                                        GeometryReader { geometry in
+                                            Capsule().fill(inkColor(ink.name)).frame(width: geometry.size.width * Double(ink.percent ?? 0) / 100)
+                                        }
+                                    }
+                                Text(ink.percent.map { "\($0)%" } ?? "—").font(.system(size: 10, weight: .medium, design: .rounded))
+                            }.frame(maxWidth: .infinity)
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(L(ink.name) + ": " + (ink.percent.map { "\($0)%" } ?? L("Unknown")))
+                        }
+                    }
+                    Text(L("Readings may be cached.")).font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+            }
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 9) {
+                shortcut("Print a photo or PDF", "photo.on.rectangle", .printing)
+                shortcut("Print jobs", "list.bullet.rectangle", .jobs)
+                shortcut("Printer care", "wrench.and.screwdriver", .maintenance)
+                if model.menuShowsSetup { shortcut("Wi-Fi setup", "wifi", .wifi) }
+            }
+            Divider()
+            HStack {
+                Button { Task { await model.refresh() } } label: { Label(L("Refresh"), systemImage: "arrow.clockwise") }
+                    .buttonStyle(.plain).font(.system(size: 11)).disabled(model.refreshing)
+                Spacer()
+                Button { open(.diagnostics) } label: { Image(systemName: "stethoscope") }
+                    .buttonStyle(.plain).help(L("Diagnostics")).accessibilityLabel(L("Diagnostics"))
+                Button { NSApp.terminate(nil) } label: { Image(systemName: "power") }
+                    .buttonStyle(.plain).padding(.leading, 10).help(L("Quit Epson Legacy Connect")).accessibilityLabel(L("Quit Epson Legacy Connect"))
+            }.foregroundStyle(.secondary)
+        }.padding(20).frame(width: 380).background(.regularMaterial)
+            .environment(\.locale, model.language.locale)
+    }
+}
+
 enum Destination: String, CaseIterable, Identifiable {
     case overview = "Your printer", wifi = "Wi-Fi setup", driver = "Printer driver"
-    case maintenance = "Maintenance", power = "Power", diagnostics = "Diagnostics"
+    case airprint = "AirPrint", printing = "Print", jobs = "Print jobs", maintenance = "Maintenance", power = "Power", diagnostics = "Diagnostics"
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .overview: return "printer"
         case .wifi: return "wifi"
         case .driver: return "shippingbox"
+        case .airprint: return "iphone.and.arrow.forward"
+        case .printing: return "photo.on.rectangle"
+        case .jobs: return "list.bullet.rectangle"
         case .maintenance: return "wrench.and.screwdriver"
         case .power: return "power"
         case .diagnostics: return "waveform.path.ecg"
@@ -93,11 +233,37 @@ enum Destination: String, CaseIterable, Identifiable {
     @Published var language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: "assistant.language") ?? "system") ?? .system {
         didSet { UserDefaults.standard.set(language.rawValue, forKey: "assistant.language") }
     }
+    @Published var showMenuBar = UserDefaults.standard.object(forKey: "assistant.menuBar") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showMenuBar, forKey: "assistant.menuBar"); updateStatusMenu() }
+    }
+    @Published var menuShowsInk = UserDefaults.standard.object(forKey: "assistant.menuInk") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(menuShowsInk, forKey: "assistant.menuInk") }
+    }
+    @Published var menuShowsSetup = UserDefaults.standard.object(forKey: "assistant.menuSetup") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(menuShowsSetup, forKey: "assistant.menuSetup") }
+    }
+    @Published var showingMenuPreferences = false
+    private var statusMenu: PrinterStatusMenu?
+    func openQuickMenu() { statusMenu?.show() }
+    var showDashboard: (() -> Void)?
+    func updateStatusMenu() {
+        if showMenuBar && statusMenu == nil { statusMenu = PrinterStatusMenu(model: self) }
+        if !showMenuBar { statusMenu?.remove(); statusMenu = nil }
+    }
     @Published var destination: Destination? = .overview
     @Published var snapshot: PrinterSnapshot?
     @Published var refreshing = false
-    @Published var ssid = ""
+    @Published var ssid = "" {
+        didSet {
+            if !connecting && oldValue != ssid { connectionVerified = false; connectionStatus = "" }
+        }
+    }
     @Published var password = ""
+    @Published var healthMessage = ""
+    @Published var checkingHealth = false
+    @Published var printerReachable: Bool?
+    @Published var lastHealthCheck: Date?
+    @Published var setupRepairBusy = false
     @Published var powerTimer: PowerOffTimer = .alwaysOn
     @Published var network: NetworkState?
     @Published var checkingNetwork = false
@@ -112,12 +278,158 @@ enum Destination: String, CaseIterable, Identifiable {
     @Published var connectionStatus = ""
     @Published var connectionVerified = false
     let discovery = PrinterDiscovery()
+    let bridge = AirPrintCoordinator()
+    @Published var airPrintPreferred = UserDefaults.standard.bool(forKey: "assistant.airPrint") {
+        didSet { UserDefaults.standard.set(airPrintPreferred, forKey: "assistant.airPrint") }
+    }
+    func updateBridge(approveNetwork: Bool = false) async {
+        if !airPrintPreferred { bridge.disable(); return }
+        guard !bridge.enabled, !bridge.busy,
+              let queue = snapshot?.queues.first(where: { $0.id == selectedQueue && $0.isNetwork }),
+              let host = URL(string: queue.uri)?.host else { return }
+        await bridge.enable(queue: queue.id, host: host, approveNetwork: approveNetwork)
+    }
     @Published var queueMessage = ""
     @Published var addingQueue = false
     @Published var cancelAddingQueue = false
     @Published var preparingUSB = false
     @Published var showingUSBLicence = false
     @Published var usbLicenceText = ""
+    @Published var selectedQueue = ""
+    @Published var documentURL: URL?
+    @Published var documentPreview: NSImage?
+    @Published var printMessage = ""
+    @Published var printJobs: [PrintJob] = []
+    @Published var jobsMessage = ""
+    @Published var loadingJobs = false
+    @Published var pendingCancel: PrintJob?
+    @Published var confirmingCancel = false
+    func chooseDocument() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.pdf, .jpeg, .png, .tiff]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = L("Choose a PDF or photo to print.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        documentURL = nil; documentPreview = nil; printMessage = ""
+        if url.pathExtension.lowercased() == "pdf" {
+            guard let document = PDFDocument(url: url), !document.isLocked, document.pageCount > 0 else {
+                printMessage = L("This PDF could not be opened or is password protected."); return
+            }
+            documentPreview = document.page(at: 0)?.thumbnail(of: NSSize(width: 420, height: 420), for: .cropBox)
+        } else {
+            guard let image = NSImage(contentsOf: url), image.isValid else { printMessage = L("This photo could not be opened."); return }
+            documentPreview = image
+        }
+        documentURL = url
+    }
+    func printDocument() {
+        guard let url = documentURL, PrinterCare.validQueue(selectedQueue),
+              let printer = PMPrinterCreateFromPrinterID(selectedQueue as CFString) else {
+            printMessage = L("Add and select a printer on this Mac first."); return
+        }
+        defer { PMRelease(UnsafeRawPointer(printer)) }
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        guard PMSessionSetCurrentPMPrinter(OpaquePointer(info.pmPrintSession()), printer) == noErr else {
+            printMessage = L("The selected printer could not be opened. Refresh the printer list and retry."); return
+        }
+        info.horizontalPagination = .fit
+        info.verticalPagination = .fit
+        info.isHorizontallyCentered = true
+        info.isVerticallyCentered = true
+        let operation: NSPrintOperation?
+        if url.pathExtension.lowercased() == "pdf" {
+            operation = PDFDocument(url: url)?.printOperation(for: info, scalingMode: .pageScaleToFit, autoRotate: true)
+        } else if let image = NSImage(contentsOf: url) {
+            let imageView = NSImageView(frame: NSRect(x: 0, y: 0, width: 540, height: 720))
+            imageView.image = image
+            imageView.imageScaling = .scaleProportionallyUpOrDown
+            operation = NSPrintOperation(view: imageView, printInfo: info)
+        } else { operation = nil }
+        guard let operation else { printMessage = L("The document could not be prepared for printing."); return }
+        operation.jobTitle = url.lastPathComponent
+        operation.showsPrintPanel = true
+        operation.showsProgressPanel = true
+        operation.printPanel.options.formUnion([.showsPaperSize, .showsOrientation, .showsScaling, .showsPreview])
+        printMessage = operation.run() ? L("Sent to macOS printing. Open Print jobs to check progress.") : L("Printing was cancelled or could not finish. Check the queue before retrying.")
+        Task { await refreshJobs() }
+    }
+    func refreshJobs(preserveMessage: Bool = false) async {
+        guard !loadingJobs else { return }
+        guard !selectedQueue.isEmpty else { jobsMessage = L("Add a wireless printer on this Mac first."); printJobs = []; return }
+        loadingJobs = true
+        defer { loadingJobs = false }
+        let queue = selectedQueue
+        let result = await Task.detached { Result { try PrintJobs.pending(queue: queue) } }.value
+        switch result {
+        case .success(let jobs):
+            printJobs = jobs
+            if !preserveMessage { jobsMessage = jobs.isEmpty ? L("No pending jobs in this queue.") : "" }
+        case .failure(let error): jobsMessage = error.localizedDescription
+        }
+    }
+    func cancelJob() async {
+        guard !loadingJobs, let job = pendingCancel else { return }
+        pendingCancel = nil
+        loadingJobs = true
+        let result = await Task.detached { Result { try PrintJobs.cancel(job) } }.value
+        switch result {
+        case .success: jobsMessage = L("The job was cancelled. A page already sent to the printer may still finish.")
+        case .failure(let error): jobsMessage = error.localizedDescription
+        }
+        loadingJobs = false
+        await refreshJobs(preserveMessage: true)
+    }
+    @Published var careActions: [CareAction] = []
+    @Published var checkingCare = false
+    @Published var careBusy = false
+    @Published var careMessage = ""
+    @Published var pendingCare: CareAction?
+    @Published var confirmCare = false
+    @Published var showingReplacement = false
+    @Published var replacementStep = 0
+    func loadCare() async {
+        guard !checkingCare, !careBusy else { return }
+        checkingCare = true
+        careActions = []
+        defer { checkingCare = false }
+        guard !selectedQueue.isEmpty else { careMessage = L("Add a wireless printer on this Mac first."); return }
+        let queue = selectedQueue
+        let result = await Task.detached { Result { try PrinterCare.capabilities(queue: queue) } }.value
+        switch result {
+        case .success(let actions): careActions = actions; careMessage = actions.isEmpty ? L("This printer driver does not advertise maintenance commands.") : L("Available commands were read from this printer's installed driver.")
+        case .failure(let error): careMessage = error.localizedDescription
+        }
+    }
+    func performCare() async {
+        guard !careBusy, let action = pendingCare, careActions.contains(action) else { return }
+        pendingCare = nil
+        careBusy = true
+        defer { careBusy = false }
+        careMessage = L("Submitting maintenance request…")
+        let queue = selectedQueue
+        let result = await Task.detached { Result { try PrinterCare.submit(action, queue: queue) } }.value
+        switch result {
+        case .failure(let error): careMessage = error.localizedDescription
+        case .success(let number):
+            careMessage = L("Request accepted by macOS. Waiting for the driver…")
+            let deadline = Date().addingTimeInterval(90)
+            while Date() < deadline {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let state = await Task.detached { try? PrinterCare.jobState(number) }.value
+                if state == .completed {
+                    careMessage = L("The driver finished this request. Check the printer; job completion does not verify the physical result.")
+                    await refresh()
+                    return
+                }
+                if state == .aborted || state == .canceled || state == .stopped || state == .held {
+                    careMessage = L("The maintenance job was stopped or held. Open the print queue before trying again.")
+                    return
+                }
+            }
+            careMessage = L("The request is still unconfirmed. Check the print queue and printer before repeating it.")
+        }
+    }
     func prepareUSB() async {
         guard !preparingUSB else { return }
         preparingUSB = true
@@ -173,13 +485,13 @@ enum Destination: String, CaseIterable, Identifiable {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
                 guard !cancelAddingQueue else { queueMessage = L("Setup cancelled."); return }
-                guard FileManager.default.fileExists(atPath: profile.ppdPath) else { throw ComponentFiles.failure("Driver installation was not confirmed. You can retry after completing the installer.") }
+                guard FileManager.default.fileExists(atPath: profile.ppdPath), PrinterDiagnostics.driverStatus().filterAvailable else { throw ComponentFiles.failure("Driver installation was not confirmed. You can retry after completing the installer.") }
             } catch { queueMessage = error.localizedDescription; return }
         }
         queueMessage = L("Adding and verifying the wireless print queue…")
         let result = await Task.detached { Result { try WirelessQueue.install(host: printer.host, model: printer.model) } }.value
         switch result {
-        case .success: queueMessage = L("The wireless printer is ready on this Mac."); await refresh()
+        case .success(let queue): selectedQueue = queue; queueMessage = L("The wireless printer is ready on this Mac."); await refresh()
         case .failure(let error): queueMessage = error.localizedDescription
         }
     }
@@ -237,22 +549,26 @@ enum Destination: String, CaseIterable, Identifiable {
         connecting = false
     }
     func scanNetworks() async {
-        guard !scanning, !checkingNetwork else { return }
+        guard !scanning, !checkingNetwork, !connecting else { return }
         scanning = true
         networkError = nil
+        networks = []
+        networkSearch = ""
         scanStatus = "Asking the printer to search for networks…"
         let result = await Task.detached { () -> Result<[WirelessNetwork], Error> in
             Result {
                 guard let path = USBConfiguration.bundledComponent() else { throw ConfigurationError.componentMissing }
                 let configuration = USBConfiguration(componentPath: path)
-                guard let printer = try configuration.printers().first else { throw ConfigurationError.noPrinter }
+                let printers = try configuration.printers()
+                guard printers.count == 1, let printer = printers.first else { throw ConfigurationError.noPrinter }
                 try configuration.startWirelessScan(printer)
-                for _ in 0..<15 {
+                for _ in 0..<30 {
                     Thread.sleep(forTimeInterval: 1)
-                    let networks = try configuration.wirelessNetworks(printer)
-                    if !networks.isEmpty { return networks }
+                    if try configuration.wirelessScanStatus(printer) == .complete {
+                        return try configuration.wirelessNetworks(printer)
+                    }
                 }
-                return []
+                throw ComponentFiles.failure("The Wi-Fi scan timed out. Try searching again.")
             }
         }.value
         switch result {
@@ -280,23 +596,67 @@ enum Destination: String, CaseIterable, Identifiable {
         }
         checkingNetwork = false
     }
-    func refresh() async {
+    func checkHealth() async {
+        guard !checkingHealth else { return }
+        checkingHealth = true
+        defer { checkingHealth = false }
+        let host = discovery.printers.first?.host ?? snapshot?.queues.first(where: { $0.id == selectedQueue && $0.isNetwork }).flatMap { URL(string: $0.uri)?.host }
+        guard let host else {
+            printerReachable = nil
+            lastHealthCheck = Date()
+            healthMessage = snapshot?.usbPresent == true ? L("USB is connected. Set up Wi-Fi to make this printer available on your network.") : L("No network printer found. Check power, use the main home Wi-Fi, and connect USB if the printer needs new router settings.")
+            return
+        }
+        let reachable = await Task.detached { NetworkVerification.printPortReachable(host) }.value
+        printerReachable = reachable
+        lastHealthCheck = Date()
+        if !reachable {
+            healthMessage = L("The printer's network port is not responding. Check power and the main Wi-Fi network. A stored print queue alone does not prove a connection.")
+        } else if snapshot?.driver.ready != true {
+            healthMessage = L("The printer is reachable. Its Epson driver needs attention on this Mac.")
+        } else if snapshot?.queues.contains(where: { $0.isNetwork }) != true {
+            healthMessage = L("The printer is reachable. Add its wireless queue to this Mac to print.")
+        } else { healthMessage = L("The printer is reachable and its driver and wireless queue are installed.") }
+    }
+    func repairSetup() async {
+        guard !setupRepairBusy, !addingQueue else { return }
+        setupRepairBusy = true
+        defer { setupRepairBusy = false }
+        if let printer = discovery.printers.first {
+            await addPrinter(printer)
+        } else if snapshot?.driver.ready != true {
+            await installDriver()
+        } else {
+            healthMessage = L("Check the printer's power and Wi-Fi first. USB setup can change its router settings; the app will not overwrite them automatically.")
+        }
+        await refresh()
+        await checkHealth()
+    }
+    func refresh(rescan: Bool = false) async {
         guard !refreshing else { return }
         refreshing = true
-        discovery.start()
+        discovery.start(restart: rescan)
         let result = await Task.detached { PrinterDiagnostics.capture() }.value
         snapshot = result
+        if !result.queues.contains(where: { $0.id == selectedQueue }) {
+            selectedQueue = result.queues.first(where: { $0.isNetwork })?.id ?? result.queues.first?.id ?? ""
+        }
         refreshing = false
+        await checkHealth()
+        await updateBridge()
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var model: AssistantModel
+    @Environment(\.openWindow) private var openWindow
     var body: some View {
         NavigationSplitView {
             VStack(alignment: .leading, spacing: 24) {
                 HStack(spacing: 10) {
-                    Image(systemName: "printer.filled").font(.title2).foregroundStyle(.teal)
+                    if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"), let icon = NSImage(contentsOfFile: path) {
+                        Image(nsImage: icon).resizable().frame(width: 36, height: 36).accessibilityHidden(true)
+                    }
                     VStack(alignment: .leading) {
                         Text("Epson Legacy").font(.headline)
                         Text("ASSISTANT").font(.caption2.weight(.semibold)).tracking(2).foregroundStyle(.secondary)
@@ -310,8 +670,10 @@ struct ContentView: View {
                     Picker("Language", selection: $model.language) {
                         ForEach(AppLanguage.allCases) { Text($0.label).tag($0) }
                     }.disabled(model.connecting)
+                    Toggle("Show in menu bar", isOn: $model.showMenuBar).font(.caption)
+                    Button("Menu preferences") { model.showingMenuPreferences = true }.font(.caption)
                     Text("Legacy Connect").font(.caption.weight(.semibold))
-                    Text("Development build · Hardware testing in progress")
+                    Text("v2 Preview · Hardware testing in progress")
                         .font(.caption2).foregroundStyle(.secondary)
                 }.padding(16)
             }.navigationSplitViewColumnWidth(220)
@@ -325,20 +687,32 @@ struct ContentView: View {
                         }
                         Spacer()
                         if model.refreshing { ProgressView().controlSize(.small) }
-                        Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                        if model.showMenuBar {
+                            Button { model.openQuickMenu() } label: { Label("Printer menu", systemImage: "menubar.rectangle") }
+                        }
+                        Button { Task { await model.refresh(rescan: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                             .disabled(model.refreshing)
                     }
                     switch model.destination ?? .overview {
                     case .overview: OverviewView(discovery: model.discovery)
                     case .wifi: WiFiView()
                     case .driver: DriverView()
-                    case .maintenance: DevelopmentCard(title: "Printer care", message: "Nozzle checks, head cleaning, alignment and ink status will be integrated after their commands are verified against this printer.", symbol: "wrench.and.screwdriver")
+                    case .airprint: AirPrintView(bridge: model.bridge)
+                    case .printing: PrintView()
+                    case .jobs: JobsView()
+                    case .maintenance: MaintenanceView()
                     case .power: PowerView()
                     case .diagnostics: DiagnosticsView()
                     }
                 }.padding(32).frame(maxWidth: 1100, alignment: .leading)
             }.background(Color(nsColor: .windowBackgroundColor))
         }.tint(.teal)
+        .onAppear {
+            model.showDashboard = { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+            model.updateStatusMenu()
+        }
+        .sheet(isPresented: $model.showingMenuPreferences) { MenuPreferencesView(model: model) }
+        .sheet(isPresented: $model.showingReplacement) { CartridgeReplacementView().environmentObject(model) }
         .sheet(isPresented: $model.showingUSBLicence) {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Epson component licence").font(.title2.bold())
@@ -370,8 +744,9 @@ struct OverviewView: View {
     @ObservedObject var discovery: PrinterDiscovery
     var wifiDetected: Bool { !discovery.printers.isEmpty }
     var body: some View {
+        HealthView(discovery: model.discovery)
         NetworkPrintersView(discovery: model.discovery)
-        Card {
+        if !wifiDetected { Card {
             HStack(spacing: 30) {
                 Image(systemName: "printer.fill").font(.system(size: 80)).foregroundStyle(.teal.gradient)
                     .frame(width: 150, height: 145).accessibilityHidden(true)
@@ -383,6 +758,7 @@ struct OverviewView: View {
                 }
             }
         }
+        }
         HStack(alignment: .top, spacing: 16) {
             Card {
                 Label("Printer driver", systemImage: "shippingbox").font(.headline)
@@ -393,7 +769,7 @@ struct OverviewView: View {
             Card {
                 Label("Network connection", systemImage: "wifi").font(.headline)
                 Text(wifiDetected ? L("Found on Wi-Fi") : (model.network.map { $0.hasAssignedAddress ? $0.address : L("Waiting for setup") } ?? L("Not verified"))).font(.title3.bold())
-                Text(L(wifiDetected ? "Network printer discovered. Add it to this Mac to start printing." : (model.network == nil ? "Read the printer's own settings to check its connection." : "Network address read directly from the printer over USB."))).foregroundStyle(.secondary)
+                Text(L(wifiDetected ? (model.snapshot?.queues.contains(where: { $0.isNetwork }) == true ? "The printer is ready. You can print without USB." : "Network printer discovered. Add it to this Mac to start printing.") : (model.network == nil ? "Read the printer's own settings to check its connection." : "Network address read directly from the printer over USB."))).foregroundStyle(.secondary)
                 Button("Open setup") { model.destination = .wifi }
             }
         }
@@ -422,6 +798,33 @@ struct OverviewView: View {
     }
 }
 
+struct HealthView: View {
+    @EnvironmentObject var model: AssistantModel
+    @ObservedObject var discovery: PrinterDiscovery
+    var body: some View {
+        Card {
+            HStack {
+                Label("Printer health", systemImage: model.printerReachable == true ? "checkmark.circle.fill" : "stethoscope").font(.headline)
+                Spacer()
+                if model.checkingHealth || model.setupRepairBusy { ProgressView().controlSize(.small) }
+                Button("Check now") { Task { await model.checkHealth() } }.disabled(model.checkingHealth)
+            }
+            Text(model.healthMessage.isEmpty ? L("Checking your printer…") : model.healthMessage).foregroundStyle(.secondary)
+            if let date = model.lastHealthCheck { Text(L("Last checked %@.", date.formatted(.dateTime.locale(model.language.locale).hour().minute().second()))).font(.caption).foregroundStyle(.secondary) }
+            HStack {
+                if model.printerReachable == true && model.snapshot?.driver.ready == true && model.snapshot?.queues.contains(where: { $0.isNetwork }) == true {
+                    Button("Print a photo or PDF") { model.destination = .printing }.buttonStyle(.borderedProminent)
+                    Button("Print jobs") { model.destination = .jobs }
+                } else {
+                    Button("Repair setup on this Mac") { Task { await model.repairSetup() } }
+                        .disabled(model.setupRepairBusy || model.addingQueue || model.checkingInstaller)
+                    Button("Wi-Fi setup") { model.destination = .wifi }
+                }
+            }
+        }.task(id: discovery.printers.map(\.host).joined(separator: ",")) { await model.checkHealth() }
+    }
+}
+
 struct NetworkPrintersView: View {
     @EnvironmentObject var model: AssistantModel
     @ObservedObject var discovery: PrinterDiscovery
@@ -439,8 +842,12 @@ struct NetworkPrintersView: View {
                         Text("Discovered directly on your local network. USB is optional for printing.").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Add to this Mac") { Task { await model.addPrinter(printer) } }
-                        .buttonStyle(.borderedProminent).disabled(model.addingQueue)
+                    if model.snapshot?.queues.contains(where: { $0.isNetwork && URL(string: $0.uri)?.host?.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() == printer.host.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() }) == true {
+                        Label("Ready on this Mac", systemImage: "checkmark.circle.fill").foregroundStyle(.teal)
+                    } else {
+                        Button("Add to this Mac") { Task { await model.addPrinter(printer) } }
+                            .buttonStyle(.borderedProminent).disabled(model.addingQueue)
+                    }
                 }
             }
             if let error = discovery.error { Text(error).foregroundStyle(.orange) }
@@ -515,9 +922,9 @@ struct WiFiView: View {
                         Image(systemName: model.ssid == network.ssid ? "checkmark.circle.fill" : "wifi")
                         Text(network.ssid)
                         Spacer()
-                        Text(network.securityType == 4 ? "WPA2" : L("Security mode %d", network.securityType)).font(.caption).foregroundStyle(.secondary)
+                        Text(network.securityType == 4 ? "WPA2" : L("WPA2 required in this build")).font(.caption).foregroundStyle(.secondary)
                     }.padding(10).contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                }.buttonStyle(.plain).disabled(model.connecting || model.scanning || network.securityType != 4)
                     .background(model.ssid == network.ssid ? Color.teal.opacity(0.12) : Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel(L("Select network %@", network.ssid))
             }
@@ -538,6 +945,7 @@ struct WiFiView: View {
             }
             if model.connectionVerified {
                 Text("The printer now uses its own Wi-Fi connection. Setting up a wireless print queue on this Mac is the next step.").foregroundStyle(.secondary)
+                Button("Finish setup on this Mac") { model.destination = .overview; Task { await model.refresh(rescan: true) } }.buttonStyle(.borderedProminent)
             }
         }.onDisappear { model.password = "" }
         Card {
@@ -566,6 +974,198 @@ struct DriverView: View {
             Text(model.installerMessage).foregroundStyle(.secondary)
             Text("macOS may ask for an administrator password. You can review Epson's licence in the installer.").font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+struct AirPrintView: View {
+    @EnvironmentObject var model: AssistantModel
+    @ObservedObject var bridge: AirPrintCoordinator
+    var body: some View {
+        Card {
+            Label(L("AirPrint for iPhone and iPad"), systemImage: "iphone.and.arrow.forward").font(.title2.bold())
+            Text(L("An eligible Mac running this utility can provide AirPrint for your wireless Epson printer. The app automatically chooses one host; other eligible Macs wait on standby.")).foregroundStyle(.secondary)
+            Toggle(L("Enable quiet AirPrint hosting"), isOn: Binding(get: { model.airPrintPreferred }, set: { value in
+                model.airPrintPreferred = value
+                Task { await model.updateBridge(approveNetwork: value) }
+            })).disabled(bridge.busy)
+            if bridge.busy { ProgressView().controlSize(.small) }
+            Label(bridge.status, systemImage: bridge.hosting ? "checkmark.circle.fill" : "info.circle").foregroundStyle(bridge.hosting ? Color.teal : Color.secondary)
+            if model.selectedQueue.isEmpty { Text(L("Add a wireless printer on this Mac first.")).foregroundStyle(.orange) }
+            Text(L("Routine hosting is silent. Keep at least one eligible Mac awake with the utility running. macOS may request Local Network or incoming-connection permission.")).font(.caption).foregroundStyle(.secondary)
+            Text(L("Experimental: physical iPhone/iPad printing and multi-Mac takeover are not verified yet. Jobs already accepted by an unavailable Mac are not automatically replayed on another Mac.")).font(.caption).foregroundStyle(.orange)
+            Text(L("This does not change the printer's firmware or enable global macOS printer sharing. Other people on the reachable home network can submit print jobs while hosting is enabled.")).font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button(L("Enable on this network")) { Task { await model.updateBridge(approveNetwork: true) } }.disabled(bridge.busy || bridge.enabled || !model.airPrintPreferred)
+                Button(L("Menu preferences")) { model.showingMenuPreferences = true }
+            }
+        }
+    }
+}
+
+struct QueuePicker: View {
+    @EnvironmentObject var model: AssistantModel
+    var body: some View {
+        if let queues = model.snapshot?.queues, !queues.isEmpty {
+            Picker("Printer queue", selection: $model.selectedQueue) {
+                ForEach(queues) { Text($0.id).tag($0.id) }
+            }.disabled(model.careBusy || model.loadingJobs)
+        } else {
+            Text("Add a wireless printer on this Mac first.").foregroundStyle(.secondary)
+            Button("Your printer") { model.destination = .overview }
+        }
+    }
+}
+
+struct PrintView: View {
+    @EnvironmentObject var model: AssistantModel
+    var body: some View {
+        Card {
+            Label("Print a photo or PDF", systemImage: "photo.on.rectangle").font(.title2.bold())
+            QueuePicker()
+            Text("Use the Epson driver controls in the print dialog for paper size, photo paper, quality, color and borderless options supported by your printer.").foregroundStyle(.secondary)
+            if let image = model.documentPreview {
+                Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 300)
+                    .accessibilityLabel("Selected document preview")
+            }
+            if let url = model.documentURL { Text(url.lastPathComponent).font(.headline).textSelection(.enabled) }
+            HStack {
+                Button("Choose photo or PDF") { model.chooseDocument() }
+                Button("Print…") { model.printDocument() }.buttonStyle(.borderedProminent)
+                    .disabled(model.documentURL == nil || model.selectedQueue.isEmpty)
+            }
+            if !model.printMessage.isEmpty { Text(model.printMessage).foregroundStyle(.secondary) }
+        }
+    }
+}
+
+struct JobsView: View {
+    @EnvironmentObject var model: AssistantModel
+    var body: some View {
+        Card {
+            Label("Print jobs", systemImage: "list.bullet.rectangle").font(.title2.bold())
+            QueuePicker()
+            Button("Refresh jobs") { Task { await model.refreshJobs() } }.disabled(model.loadingJobs)
+            if model.loadingJobs { ProgressView().controlSize(.small) }
+            ForEach(model.printJobs) { job in
+                HStack {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(L("Job %d", job.id)).font(.headline)
+                        Text(job.owner + " · " + ByteCountFormatter.string(fromByteCount: Int64(job.bytes), countStyle: .file)).foregroundStyle(.secondary)
+                        Text(job.submitted).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Cancel job", role: .destructive) { model.pendingCancel = job; model.confirmingCancel = true }
+                        .disabled(!job.mayCancel || model.loadingJobs)
+                }
+            }
+            if !model.jobsMessage.isEmpty { Text(model.jobsMessage).foregroundStyle(.secondary) }
+            Text("Only your own pending jobs can be cancelled here. Pages already sent to the printer may still print.").font(.caption).foregroundStyle(.secondary)
+        }
+        .task { await model.refreshJobs() }
+        .onChange(of: model.selectedQueue) { _ in Task { await model.refreshJobs() } }
+        .confirmationDialog(L("Cancel job %d?", model.pendingCancel?.id ?? 0), isPresented: $model.confirmingCancel, titleVisibility: .visible) {
+            Button("Cancel job", role: .destructive) { Task { await model.cancelJob() } }
+            Button("Keep job", role: .cancel) { model.pendingCancel = nil }
+        }
+    }
+}
+
+struct MaintenanceView: View {
+    @EnvironmentObject var model: AssistantModel
+    var body: some View {
+        Card {
+            Label("Printer care", systemImage: "wrench.and.screwdriver").font(.title2.bold())
+            Text("Start with a nozzle check. Clean only if the pattern has missing lines.").foregroundStyle(.secondary)
+            if let queues = model.snapshot?.queues, !queues.isEmpty {
+                Picker("Printer queue", selection: $model.selectedQueue) {
+                    ForEach(queues) { Text($0.id).tag($0.id) }
+                }.disabled(model.careBusy || model.checkingCare)
+                Button("Check available controls") { Task { await model.loadCare() } }
+                    .disabled(model.careBusy || model.checkingCare)
+            }
+            if model.checkingCare || model.careBusy { ProgressView().controlSize(.small) }
+            ForEach(model.careActions) { action in
+                Divider()
+                Text(action.title).font(.headline)
+                Text(action.instructions).foregroundStyle(.secondary)
+                Button(action.title) {
+                    model.pendingCare = action
+                    model.confirmCare = true
+                }.disabled(model.careBusy || model.checkingCare)
+            }
+            if !model.careMessage.isEmpty { Text(model.careMessage).textSelection(.enabled).foregroundStyle(.secondary) }
+            Button("Open print queue") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Print Center.app"))
+            }
+            Divider()
+            Label("Replace ink cartridges", systemImage: "drop.fill").font(.headline)
+            Text("A guided 1500W replacement flow using the printer's ink button. This does not send a carriage-movement command.").foregroundStyle(.secondary)
+            Button("Replace cartridges…") { model.replacementStep = 0; model.showingReplacement = true }
+                .disabled(model.careBusy || model.snapshot?.queues.isEmpty != false)
+            Text("Alignment and power settings require separate model-specific commands and are still under verification.").font(.caption).foregroundStyle(.secondary)
+        }
+        .task { await model.loadCare() }
+        .onChange(of: model.selectedQueue) { _ in Task { await model.loadCare() } }
+        .confirmationDialog(model.pendingCare?.title ?? L("Printer care"), isPresented: $model.confirmCare, titleVisibility: .visible) {
+            Button(model.pendingCare?.title ?? L("Continue")) { Task { await model.performCare() } }
+            Button("Cancel", role: .cancel) { model.pendingCare = nil }
+        } message: { Text(model.pendingCare?.instructions ?? "") }
+    }
+}
+
+struct MenuPreferencesView: View {
+    @ObservedObject var model: AssistantModel
+    var body: some View {
+        HStack(alignment: .top, spacing: 28) {
+            VStack(alignment: .leading, spacing: 18) {
+                Text(L("Make the menu yours")).font(.title2.bold())
+                Text(L("Keep the controls you use most close at hand.")).foregroundStyle(.secondary)
+                Toggle(L("Show in menu bar"), isOn: $model.showMenuBar)
+                Toggle(L("Show ink levels"), isOn: $model.menuShowsInk)
+                Toggle(L("Show Wi-Fi setup shortcut"), isOn: $model.menuShowsSetup)
+                Text(L("The preview uses your printer's current readings. Cached ink data is labelled.")).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(L("Done")) { model.showingMenuPreferences = false }.buttonStyle(.borderedProminent)
+            }.frame(width: 230)
+            VStack(alignment: .leading, spacing: 10) {
+                Text(L("Menu preview")).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                PrinterQuickPanel(model: model, discovery: model.discovery) { destination in
+                    model.destination = destination
+                    model.showingMenuPreferences = false
+                }.clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(.primary.opacity(0.08)))
+            }
+        }.padding(28).frame(height: 620)
+    }
+}
+
+struct CartridgeReplacementView: View {
+    @EnvironmentObject var model: AssistantModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack {
+                Image(systemName: "drop.fill").font(.title).foregroundStyle(.teal)
+                Text(L("Replace ink cartridges")).font(.title2.bold())
+            }
+            Text(L("Epson Stylus Photo 1500 / 1500W")).foregroundStyle(.secondary)
+            ProgressView(value: Double(model.replacementStep + 1), total: Double(CartridgeGuide.titles.count))
+            Text(L("Step %d of %d", model.replacementStep + 1, CartridgeGuide.titles.count)).font(.caption).foregroundStyle(.secondary)
+            Text(L(CartridgeGuide.titles[model.replacementStep])).font(.title3.bold())
+            Text(L(CartridgeGuide.instructions[model.replacementStep])).fixedSize(horizontal: false, vertical: true)
+            Text(L("Advance only after you have completed the physical step. The app cannot verify carriage movement yet.")).font(.caption).foregroundStyle(.secondary)
+            Link(L("Epson's illustrated replacement guide"), destination: URL(string: "https://support.epson-europe.com/onlineguides/en/sp1500w/html/ink_3.htm")!)
+            Spacer(minLength: 0)
+            HStack {
+                Button(L("Close guide")) { model.showingReplacement = false }
+                Spacer()
+                if model.replacementStep > 0 { Button(L("Back")) { model.replacementStep -= 1 } }
+                if model.replacementStep + 1 < CartridgeGuide.titles.count {
+                    Button(L("I completed this step")) { model.replacementStep += 1 }.buttonStyle(.borderedProminent)
+                } else {
+                    Button(L("Finish guide")) { model.showingReplacement = false }.buttonStyle(.borderedProminent)
+                }
+            }
+        }.padding(30).frame(width: 600, height: 430)
     }
 }
 
@@ -605,9 +1205,9 @@ struct DiagnosticsView: View {
                 Divider()
                 Text(snapshot.status).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                 ForEach(snapshot.warnings, id: \.self) { warning in
-                    Label(warning, systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
+                    Label(L(warning), systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
                 }
-                Text("Wi-Fi provisioning and mobile printing have not passed end-to-end verification yet.").foregroundStyle(.secondary)
+                Text("USB-free Wi-Fi printing and settings persistence were verified on a 1500W. Mobile printing and additional models still need hardware verification.").foregroundStyle(.secondary)
             } else { ProgressView("Checking your printer…") }
         }
     }
