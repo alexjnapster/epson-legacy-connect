@@ -2,8 +2,12 @@ name: macOS checks
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   core:
     runs-on: macos-15
