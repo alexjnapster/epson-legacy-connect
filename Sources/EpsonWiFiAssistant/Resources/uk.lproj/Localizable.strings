@@ -299,3 +299,5 @@
 "Waiting for the printer and an eligible Mac." = "Очікуємо на принтер і готовий Mac.";
 "Another eligible Mac is providing AirPrint. This Mac is on standby." = "Інший Mac забезпечує AirPrint. Цей Mac очікує в резерві.";
 "The AirPrint endpoint could not be verified. Check whether another service uses port 8631 and review the bridge status." = "Не вдалося перевірити сервер AirPrint. Перевірте, чи інша служба не використовує порт 8631, та перегляньте стан сервера.";
+
+"The printer is offline. Maintenance was not queued; turn the printer on and check its Wi-Fi connection before trying again." = "Принтер недоступний. Команду обслуговування не додано до черги; увімкніть принтер і перевірте Wi-Fi перед повторною спробою.";
